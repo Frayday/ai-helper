@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+
+import tkinter as tk
+from PIL import ImageGrab
+import requests
+import base64
+import io
+import keyboard # Requires root/admin for global hotkeys
+import sys
+import os
+import threading
+import traceback
+
+# --- Platform Specific Imports ---
+# Import ctypes only if on Windows for screen capture protection
+if sys.platform == "win32":
+    try:
+        import ctypes
+        from ctypes import wintypes
+        print("Imported ctypes for Windows screen capture protection.")
+    except ImportError:
+        print("WARNING: ctypes module not found. Screen capture protection disabled.")
+        ctypes = None
+else:
+    ctypes = None
+    print("Not on Windows. Screen capture protection via SetWindowDisplayAffinity skipped.")
+
+# --- Configuration ---
+# !!! IMPORTANT: Replace YOUR_API_KEY_HERE with your actual Google API Key !!!
+API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=YOUR_API_KEY_HERE"
+
+# --- Sanity Check ---
+if "YOUR_API_KEY_HERE" in API_ENDPOINT:
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("!!! WARNING: API Key placeholder detected in API_ENDPOINT.  !!!")
+    print("!!! Please replace it with your actual Google API key.    !!!")
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # Consider exiting if key is missing: sys.exit("Exiting: API key not configured.")
+
+# --- UI and Hotkey Settings ---
+HOTKEY_CAPTURE = 'ctrl+alt+s'   # Hotkey to trigger screenshot and query
+HOTKEY_EXIT = 'ctrl+alt+x'      # Hotkey to close the application
+TRANSPARENCY = 0.8              # Overlay transparency (0.0=invisible, 1.0=opaque)
+WINDOW_POSITION = "+10+10"      # Initial window position (e.g., "+10+10" for top-left)
+FONT_SETTINGS = ("Arial", 12)   # Font: (Family, Size)
+LABEL_BG = "#222222"            # Dark background for the text area
+LABEL_FG = "#E0E0E0"            # Light grey text color for readability
+PROCESSING_TEXT = "Processing..."
+ERROR_PREFIX = "Error: "
+
+# --- Global Variables ---
+root = None           # The main Tkinter window (initialized later)
+label = None          # The label widget displaying text (initialized later)
+is_processing = False # Lock to prevent multiple simultaneous requests
+
+# --- Core Functions ---
+
+def get_api_response(image_bytes):
+    """Sends image to Google Gemini API and returns the response text."""
+    global API_ENDPOINT
+    print("Encoding image and sending to Google API...")
+    try:
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+           "contents": [{
+               "parts": [
+                   {"text": "Analyze this screenshot and provide a solution to leet code."},
+                   {"inline_data": {
+                       "mime_type": "image/png",
+                       "data": base64_image
+                   }}
+               ]
+           }],
+           "generationConfig": {
+               "maxOutputTokens": 8192,
+               "temperature": 0.4,
+           }
+        }
+
+        response = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=60)
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+        print("Google API Response Received.")
+        api_result = response.json()
+
+        # Parse the response safely
+        text_response = f"{ERROR_PREFIX}Could not parse API response structure." # Default error
+        try:
+            if 'candidates' in api_result and api_result['candidates']:
+                candidate = api_result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content'] and candidate['content']['parts']:
+                    text_response = candidate['content']['parts'][0].get('text', '')
+                    if not text_response:
+                        text_response = f"{ERROR_PREFIX}API returned empty content."
+                    else:
+                         print("Successfully parsed API response text.")
+            elif 'promptFeedback' in api_result and 'blockReason' in api_result['promptFeedback']:
+                 reason = api_result['promptFeedback']['blockReason']
+                 text_response = f"{ERROR_PREFIX}Blocked by API ({reason})."
+                 print(f"API request blocked: {reason}")
+
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
+            print(f"Error parsing Google API response JSON: {e}")
+            # Keep the default error message
+
+        if ERROR_PREFIX in text_response:
+            print(f"--- Full API Response (due to error) ---\n{api_result}\n---")
+
+        return text_response.strip()
+
+    except requests.exceptions.Timeout:
+        print("API Request Error: Timeout")
+        return f"{ERROR_PREFIX}Google API request timed out."
+    except requests.exceptions.HTTPError as e:
+        print(f"API Request HTTP Error: {e}")
+        status_code = e.response.status_code
+        error_text = e.response.text[:200] # Limit error length
+        if status_code == 400 and "API key not valid" in e.response.text:
+             return f"{ERROR_PREFIX}API Key likely invalid (400)."
+        elif status_code == 400:
+             return f"{ERROR_PREFIX}Bad request (400).\n{error_text}"
+        elif status_code == 403:
+             return f"{ERROR_PREFIX}Forbidden (403). Check Key permissions."
+        elif status_code == 429:
+             return f"{ERROR_PREFIX}Rate limit exceeded (429)."
+        else:
+             return f"{ERROR_PREFIX}HTTP Error {status_code}.\n{error_text}"
+    except requests.exceptions.RequestException as e:
+        print(f"API Request Error (Network/Connection): {e}")
+        return f"{ERROR_PREFIX}Could not reach Google API.\nCheck network connection."
+    except Exception as e:
+        print(f"Unexpected error during API interaction: {e}")
+        traceback.print_exc()
+        return f"{ERROR_PREFIX}Unexpected error processing API request."
+
+def update_overlay(text=""):
+    """Safely updates the text and visibility of the overlay window."""
+    if not root or not label or not root.winfo_exists():
+        return # Exit if window/widget is gone
+    try:
+        # Truncate very long text
+        max_chars = 3000
+        display_text = (text[:max_chars] + "\n... (truncated)") if len(text) > max_chars else text
+
+        label.config(text=display_text)
+        if display_text:
+            # Simple geometry calculation (adjust multipliers if needed)
+            lines = display_text.count('\n') + 1
+            max_line_len = max((len(line) for line in display_text.split('\n')), default=10)
+            font_size = FONT_SETTINGS[1]
+            w_pixels = int(max_line_len * (font_size * 0.65) + 30) # Width estimate
+            h_pixels = int(lines * (font_size * 1.6) + 20)       # Height estimate
+
+            # Clamp dimensions
+            w_pixels = max(150, min(w_pixels, 800))
+            h_pixels = max(50, min(h_pixels, 600))
+
+            root.geometry(f"{w_pixels}x{h_pixels}{WINDOW_POSITION}")
+            root.attributes('-alpha', TRANSPARENCY)
+            root.deiconify() # Show window
+        else:
+            root.withdraw() # Hide window
+        root.update_idletasks()
+    except tk.TclError as e:
+        print(f"Tkinter TclError updating overlay (likely during shutdown): {e}")
+    except Exception as e:
+        print(f"Unexpected error updating overlay: {e}")
+        traceback.print_exc()
+        # Attempt to show error in overlay
+        try:
+            label.config(text=f"Overlay Update Error:\n{e}")
+            root.geometry(f"300x100{WINDOW_POSITION}")
+            root.attributes('-alpha', TRANSPARENCY)
+            root.deiconify()
+            root.update_idletasks()
+        except:
+            print("!!! Critical overlay update failure after error !!!")
+
+def processing_task():
+    """Contains the blocking operations (screenshot, API call)."""
+    global is_processing
+    try:
+        print("Capturing screen...")
+        screenshot = ImageGrab.grab(bbox=None, all_screens=True)
+        print(f"Screenshot captured (Size: {screenshot.size}).")
+
+        img_bytes_io = io.BytesIO()
+        screenshot.save(img_bytes_io, format='PNG')
+        img_bytes = img_bytes_io.getvalue()
+        print(f"Screenshot converted to {len(img_bytes)} bytes (PNG).")
+
+        response_text = get_api_response(img_bytes)
+        root.after(0, update_overlay, response_text) # Update UI on main thread
+
+    except ImportError:
+         print("Error: Pillow (PIL) library not found or ImageGrab failed.")
+         root.after(0, update_overlay, f"{ERROR_PREFIX}Pillow/ImageGrab missing.")
+    except Exception as e:
+        print(f"Error during capture/processing thread: {e}")
+        traceback.print_exc()
+        err_msg = f"{ERROR_PREFIX}{e}"
+        # Check common Linux error if ImageGrab fails
+        if sys.platform != "win32" and ("Xlib" in str(e) or "scrot" in str(e).lower()):
+             err_msg = f"{ERROR_PREFIX}ImageGrab failed. Screenshot tool needed (e.g., scrot)?"
+        root.after(0, update_overlay, err_msg)
+    finally:
+        is_processing = False # Release the lock
+        print("--- Processing thread finished ---")
+
+def capture_and_process():
+    """Handles the hotkey press, starts the processing thread."""
+    global is_processing
+    print(f"\n--- Hotkey '{HOTKEY_CAPTURE}' detected ---")
+    if is_processing:
+        print("Request already in progress. Ignoring.")
+        return
+
+    is_processing = True
+    root.after(0, update_overlay, PROCESSING_TEXT) # Show processing message immediately
+
+    # Start the blocking tasks in a separate thread
+    thread = threading.Thread(target=processing_task, daemon=True)
+    thread.start()
+
+def apply_windows_protection(window_widget):
+    """Applies SetWindowDisplayAffinity to prevent screen capture on Windows."""
+    if not (sys.platform == "win32" and ctypes):
+        return # Only run on Windows with ctypes available
+
+    print("Attempting to apply screen capture protection (Windows)...")
+    try:
+        WDA_MONITOR = 1 # Constant: Prevents capture except on physical monitor
+        user32 = ctypes.windll.user32
+        set_display_affinity = user32.SetWindowDisplayAffinity
+        set_display_affinity.restype = wintypes.BOOL
+        set_display_affinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+
+        window_widget.update_idletasks() # Ensure window handle is valid
+        hwnd = window_widget.winfo_id()
+
+        success = set_display_affinity(hwnd, WDA_MONITOR)
+        if success:
+            print("Successfully applied SetWindowDisplayAffinity(WDA_MONITOR).")
+        else:
+            error_code = ctypes.GetLastError()
+            print(f"WARNING: SetWindowDisplayAffinity failed. Error code: {error_code}")
+    except Exception as e:
+        print(f"Error applying screen capture protection: {e}")
+        traceback.print_exc()
+
+def setup_overlay_window():
+    """Creates and configures the main Tkinter window."""
+    global root, label
+    print("Setting up overlay window...")
+    root = tk.Tk()
+    root.withdraw() # Start hidden
+    root.overrideredirect(True) # Borderless
+    root.geometry(WINDOW_POSITION)
+    root.wm_attributes('-topmost', 1) # Always on top
+    root.attributes('-alpha', 0.0) # Start fully transparent
+
+    label = tk.Label(root, text="", font=FONT_SETTINGS, fg=LABEL_FG, bg=LABEL_BG,
+                     justify=tk.LEFT, anchor='nw', padx=10, pady=10,
+                     wraplength=780) # Adjust wraplength as needed
+    label.pack(expand=True, fill="both")
+
+    apply_windows_protection(root) # Apply protection if on Windows
+
+    print("Overlay window configured.")
+    return root
+
+def safe_quit():
+    """Safely unhooks hotkeys and destroys the Tkinter window."""
+    global root, is_processing
+    print("\nInitiating shutdown...")
+    is_processing = True # Prevent new processing during quit
+
+    try:
+        print("Unhooking hotkeys...")
+        keyboard.unhook_all()
+    except Exception as e:
+        print(f"Note: Error during hotkey unhooking: {e}")
+
+    if root:
+        try:
+            print("Destroying Tkinter window...")
+            root.destroy()
+        except Exception as e:
+            print(f"Error destroying Tkinter root: {e}")
+        finally:
+             root = None # Ensure reference is cleared
+
+    print("Shutdown complete.")
+
+def check_privileges():
+    """Prints warnings if script lacks necessary privileges for global hotkeys."""
+    print("Checking privileges for global hotkeys...")
+    has_privileges = False
+    try:
+        if sys.platform == "win32" and ctypes:
+            has_privileges = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            privilege_type = "Administrator"
+            run_command = "Right-click -> 'Run as administrator'"
+        elif hasattr(os, 'getuid'): # Linux/macOS
+            has_privileges = os.getuid() == 0
+            privilege_type = "root (sudo)"
+            run_command = f"sudo {sys.executable} {os.path.abspath(__file__)}"
+        else:
+            print("Could not determine privileges for this OS.")
+            return # Cannot check further
+
+        if not has_privileges:
+            print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"!!! WARNING: Script not running with {privilege_type} privileges.")
+            print("!!! Global hotkeys ('keyboard' library) may not work correctly.  !!!")
+            print(f"!!! Try running via: {run_command} !!!")
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+        else:
+            print(f"Script running with {privilege_type} privileges.")
+
+    except Exception as e:
+         print(f"Warning: Error checking privileges: {e}")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    print("--- Starting Screenshot Overlay App ---")
+
+    check_privileges()
+
+    # Setup the GUI window
+    root = setup_overlay_window()
+    if not root:
+        sys.exit("FATAL: Failed to create Tkinter window. Exiting.")
+
+    # Setup Hotkeys
+    try:
+        print(f"Registering hotkeys: Capture='{HOTKEY_CAPTURE}', Exit='{HOTKEY_EXIT}'")
+        keyboard.add_hotkey(HOTKEY_CAPTURE, capture_and_process, trigger_on_release=False)
+        keyboard.add_hotkey(HOTKEY_EXIT, safe_quit, trigger_on_release=False)
+        print("Hotkeys registered successfully.")
+    except Exception as e:
+        # Provide specific guidance based on error and platform
+        error_msg = f"!!! FATAL ERROR: Failed to register hotkeys: {e}\n"
+        if "permissions" in str(e).lower() or "access is denied" in str(e).lower() or "root" in str(e).lower():
+             error_msg += "!!! This usually requires root/sudo/admin privileges.\n"
+             if sys.platform != "win32":
+                 error_msg += f"!!! Try running with: sudo {sys.executable} {os.path.abspath(__file__)}\n"
+             else:
+                 error_msg += "!!! Try running by right-clicking -> 'Run as administrator'.\n"
+        else:
+            error_msg += "!!! An unexpected error occurred setting up hotkeys.\n"
+
+        print("\n" + "!"*51)
+        print(error_msg.strip())
+        print("!"*51)
+        safe_quit() # Attempt cleanup
+        sys.exit("Exiting due to hotkey registration failure.")
+
+    # Start the Tkinter event loop
+    print(f"\nApp running. Press '{HOTKEY_CAPTURE}' to capture, '{HOTKEY_EXIT}' to quit.")
+    try:
+        if root and root.winfo_exists():
+            root.mainloop()
+        else:
+             print("Root window was destroyed before mainloop started?")
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected.")
+    except Exception as e:
+        print(f"\nUnhandled exception in main loop: {e}")
+        traceback.print_exc()
+    finally:
+        # Ensure cleanup runs even if mainloop fails unexpectedly
+        safe_quit()
+
+    print("--- Overlay App Exited ---")
